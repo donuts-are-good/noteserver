@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
 	"log/syslog"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"time"
 
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -32,16 +37,35 @@ func initDatabase() {
 		log.Fatal(err)
 	}
 
-	statement, _ := db.Prepare(`CREATE TABLE IF NOT EXISTS notes 
+	statement, err := db.Prepare(`CREATE TABLE IF NOT EXISTS notes 
 		(token TEXT, id INTEGER PRIMARY KEY, date TEXT, title TEXT, body TEXT)`)
-	statement.Exec()
+	if err != nil {
+		logger.Err("Failed to prepare DB statement: " + err.Error())
+		log.Fatal(err)
+	}
+
+	_, err = statement.Exec()
+	if err != nil {
+		logger.Err("Failed to execute DB statement: " + err.Error())
+		log.Fatal(err)
+	}
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logger.Info(r.Method + " " + r.RequestURI)
+		next.ServeHTTP(w, r)
+	})
+}
+func isValidNote(note Note) bool {
+	return note.Date != "" && note.Title != "" && note.Body != ""
 }
 
 func syncNotes(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 
 	if token == "" || len(token) != 64 {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 		return
 	}
 
@@ -87,6 +111,10 @@ func syncNotes(w http.ResponseWriter, r *http.Request) {
 		defer stmt.Close()
 
 		for _, note := range notes {
+			if !isValidNote(note) {
+				http.Error(w, "Invalid note structure", http.StatusBadRequest)
+				return
+			}
 			_, err := stmt.Exec(token, note.Date, note.Title, note.Body)
 			if err != nil {
 				logger.Err("Failed to execute statement: " + err.Error())
@@ -96,7 +124,14 @@ func syncNotes(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte("OK"))
+
 	}
+}
+
+func healthCheck(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
 }
 
 func main() {
@@ -110,10 +145,42 @@ func main() {
 	initDatabase()
 
 	r := mux.NewRouter()
+
+	corsHandler := handlers.CORS(handlers.AllowedOrigins([]string{"*"}))
+
+	r.MethodNotAllowedHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte("Method not allowed"))
+	})
+
+	r.Use(loggingMiddleware)
+
 	r.HandleFunc("/sync", syncNotes).Methods("GET", "POST")
+	r.HandleFunc("/health", healthCheck).Methods("GET")
 
-	http.Handle("/", r)
+	http.Handle("/", corsHandler(r))
 
-	log.Println("Alive! Serving on " + servePort)
-	http.ListenAndServe(servePort, nil)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+
+	srv := &http.Server{
+		Addr:         servePort,
+		Handler:      r,
+		WriteTimeout: 15 * time.Second,
+		ReadTimeout:  15 * time.Second,
+	}
+
+	go func() {
+		log.Println("Alive! Serving on " + servePort)
+		if err := srv.ListenAndServe(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	<-stop
+
+	log.Println("Shutting down the server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
 }
